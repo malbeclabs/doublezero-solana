@@ -39,37 +39,39 @@ pub struct Distribution {
     /// it was at the time this account was created.
     pub solana_validator_fee_parameters: SolanaValidatorFeeParameters,
 
+    /// Digest of Solana validator debt data found in DoubleZero Ledger.
     pub solana_validator_debt_merkle_root: Hash,
 
+    /// Total number of Solana validators that incurred debt. This number
+    /// also defines the size of the Merkle tree.
     pub total_solana_validators: u32,
+
+    /// How many Solana validators have paid off their debt.
     pub solana_validator_payments_count: u32,
 
+    /// Total amount of debt incurred by Solana validators.
     pub total_solana_validator_debt: u64,
+
+    /// How much Solana validator debt has been paid.
     pub collected_solana_validator_payments: u64,
 
+    /// Digest of rewards data found in DoubleZero Ledger.
     pub rewards_merkle_root: Hash,
 
-    /// Tracking the total number of contributors. Off-chain processes can
-    /// monitor how many are left to redeem when comparing to
-    /// [num_contributors_redeemed].
-    ///
-    /// [num_contributors_redeemed]: Self::num_contributors_redeemed
+    /// Total number of network contributors that earned rewards. This number
+    /// also defines the size of the Merkle tree.
     pub total_contributors: u32,
 
-    /// Tracking how many contributors have had rewards distributed. Offchain
-    /// processes can monitor how many are left to distribute when comparing to
-    /// [total_contributors].
-    ///
-    /// [total_contributors]: Self::total_contributors
+    /// How many contributors have collected their reward distributions.
     pub distributed_rewards_count: u32,
 
     pub collected_prepaid_2z_payments: u64,
     pub collected_2z_converted_from_sol: u64,
 
     /// The amount of SOL that was owed in past distributions. The debt
-    /// accountant can configure this amount to alleviate the system from
-    /// carrying bad debt perpetually. This amount is subtracted from the
-    /// total amount owed to the system.
+    /// accountant controls this amount by forgiving debt from any
+    /// earlier distribution to alleviate the system from carrying bad
+    /// debt indefinitely.
     pub uncollectible_sol_debt: u64,
 
     pub processed_solana_validator_debt_start_index: u32,
@@ -85,7 +87,10 @@ pub struct Distribution {
     /// calculations.
     pub calculation_allowed_timestamp: u32,
 
+    /// How many rewards have been distributed.
     pub distributed_2z_amount: u64,
+
+    /// How many rewards have been burned.
     pub burned_2z_amount: u64,
 
     pub processed_solana_validator_debt_write_off_start_index: u32,
