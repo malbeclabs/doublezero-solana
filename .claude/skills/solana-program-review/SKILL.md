@@ -11,6 +11,46 @@ Apply the classes below **class-by-class against the diff**, highest-frequency c
 
 ---
 
+## How to apply — severity and voice
+
+Not every finding carries the same weight. Sort each one before raising it.
+
+**Blocking (fix before merge)** — real correctness or safety defects:
+- A missing owner or discriminator check on an account that is **not** loaded through `ZeroCopyAccount` (a raw `AccountInfo` read that trusts unverified bytes).
+- Arithmetic that can over/underflow on a count, index, or lamport/balance value.
+- A collection cap that isn't enforced at the mutating instruction (see the heap-cap hazard below).
+- A missing changelog entry when CI enforces one.
+
+**Nit (raise, but non-blocking)** — naming/idiom drift, debug/`Display` representations, cosmetic wording. Label these explicitly as nits so the author can weigh them.
+
+**Follow-up (defer)** — broad cosmetic sweeps and refactors that don't belong to this diff. Note them and move on; don't hold the PR.
+
+**Voice**:
+- Frame judgment calls as questions ("should this be `>=`?", "can this checked-sub ever be `None`?") rather than directives.
+- Give the exact replacement code, not a prose description of it.
+- Prove any serialization/layout claim with a runnable `#[test]` (or a `const _: () = assert!(size_of::<T>() == N)`), not an assertion in the comment thread.
+- Distinguish "this is more than just a suggestion" (blocking) from "up to you" (optional) so the author knows what must change.
+
+---
+
+### Sibling-processor parity *(reviewer-curated)*
+
+**Current guidance**: A new instruction handler should mirror its **closest established sibling** unless the diff states a reason to diverge. Reviewing a new handler in isolation is how drift slips in — the handler reads fine on its own but quietly differs from the pattern every other handler follows. Compare against the nearest existing `try_*` processor and confirm it matches on:
+- **Account loading + validation shape** — same `ZeroCopyAccount::…::try_next_accounts` usage, same set of `is_signer`/owner/discriminator checks in the same order.
+- **Authority gating** — same `VerifiedProgramAuthority` / upgrade-authority routing, same read-only-authority + separate-payer split.
+- **Status / journal handling** — same replay-bit discipline, same journal-level aggregation, same idempotency guard.
+- **Counter discipline** — increments/decrements the same snapshot/collected counters the sibling does, in the same place, guarded the same way.
+
+**Why it matters**: Handlers in these programs are near-copies by design; a new one that skips a check, gates on a different authority, or forgets a counter update is a bug that only shows up when you diff it against its sibling.
+
+**What to look for in a diff**:
+- A new `try_*` handler that loads accounts differently from the sibling it's modeled on (raw fetch vs. `try_next_accounts`, different check order).
+- Authority gating that differs from sibling handlers without a stated reason.
+- Missing status/replay-bit or journal update that every sibling performs.
+- A counter (snapshot/collected/bitmap) that the sibling increments/decrements but this handler doesn't — or updates in a different, unguarded spot.
+
+---
+
 ### naming & idiom / code style
 
 **Current guidance** (as of 2026-04-21): Names must be precise and consistent. Suffix `AccountInfo` bindings with `_info`. Rename types/vars to match their true meaning (`SolanaValidatorPayment` -> `SolanaValidatorDebt`; a bare `doublezero` -> `doublezero_ledger`). Use a `get_` prefix on fetchers. From an integration's perspective, prefer `associated_`/`parent_`/`canonical_` prefixes over a program-specific abbreviation. Reuse the existing `new_transaction` helper rather than re-rolling transaction construction. Provide `From` conversions instead of ad-hoc casts. Express domain quantities in the domain's own units (slots/epochs over human time). Use a `//` separator/summary line to describe the next several lines, not each individual line.
@@ -59,6 +99,8 @@ Apply the classes below **class-by-class against the diff**, highest-frequency c
 
 **Current guidance** (as of 2026-04-22): Validate accounts and signers only where the runtime doesn't already guarantee it. Trim redundant checks: don't re-check an account is writable when the CPI/account-meta already requires it, don't re-verify a program account that a downstream CPI will implicitly require, and lean on the system program's own revert for already-created accounts rather than hand-rolling an owner check. Conversely, **do add missing signer checks the runtime won't catch** (e.g. verifying the associated distribution's `info.is_signer`). Prefer the shared `ZeroCopyAccount::try_next_accounts` helpers over ad-hoc account fetching.
 
+**Hardcoded expected program id**: When checking an account's `owner` against another program's id (e.g. the rewards-integration program), the expected id **must** come from a hardcoded in-repo constant — never from an instruction argument or a caller-passed account. An "expected owner" supplied by the caller is no check at all: the caller just names whichever program it wants and the comparison trivially passes.
+
 **Why it matters**: Redundant checks add compute and code that can drift from the real invariant; but a genuinely missing signer check is a security hole the runtime will not backstop.
 
 **What to look for in a diff**:
@@ -67,6 +109,7 @@ Apply the classes below **class-by-class against the diff**, highest-frequency c
 - Hand-rolled "already initialized" owner checks instead of letting the system program revert.
 - Missing `info.is_signer` assertions on accounts that must sign (e.g. the associated distribution).
 - Ad-hoc account iteration instead of `ZeroCopyAccount::try_next_accounts`.
+- An owner check where the expected program id comes from an instruction arg or a caller-passed account instead of a hardcoded in-repo constant.
 
 **Examples**:
 - "This actually isn't necessary because your instruction is already trying to invoke rewards_integration.program_id at line 1994. If the integration program weren't provided as an account, your CPI call would fail" — on `// - 6: Integration program (executable, must match rewards_integration.program_id).` [doublezerofoundation/doublezero-solana#116](https://github.com/doublezerofoundation/doublezero-solana/pull/116)
@@ -80,6 +123,8 @@ Apply the classes below **class-by-class against the diff**, highest-frequency c
 
 **Current guidance** (as of 2026-04-16): Reserve generous forward-compatible space in every account: keep a `StorageGap` and add extra reserved gap/flags fields (e.g. reserve 8 bytes for a future `_flags: Flags`, bump a gap from 1 to 4) so new fields can be added without a migration. Add compile-time `size_of` asserts so any accidental layout change is caught and tied to a deliberate migration. Fold optional deposits directly onto the rent-exemption amount (via an `additional_lamports` option on the create-account recipe) so an admin cannot misconfigure a deposit below the rent minimum; this also avoids extra rent syscalls. Don't request extra lamports for token accounts.
 
+**Heap-cap hazard** *(reviewer-curated)*: If a diff grows an account-stored collection (a `Vec` or other dynamically-sized region), its maximum size **must** be enforced at the mutating instruction — the handler that appends/reallocs — not just documented. An over-grown account overflows the 32KB program heap when it's later loaded, which bricks **every** instruction that reads that account, not only the one that grew it. Pair the cap check with a near-cap boundary test (fill to `cap - 1`, then `cap`, then assert the `cap + 1` append reverts).
+
 **Why it matters**: Once an account is live, changing its size means a migration; reserved gap/flags space and size asserts turn silent layout drift into a compile error and let fields be added later. Folding deposits onto rent guarantees the account is always rent-exempt.
 
 **What to look for in a diff**:
@@ -88,6 +133,7 @@ Apply the classes below **class-by-class against the diff**, highest-frequency c
 - A deposit added separately from rent (risk of falling below rent-exempt minimum) instead of via `additional_lamports`.
 - An extra `Rent::get`/rent syscall that could be avoided.
 - Extra lamports requested for a token account.
+- A diff that grows an account-stored `Vec`/dynamic region with no cap check at the mutating instruction, or no near-cap boundary test for it.
 
 **Examples**:
 - "Also can we reserve 8 bytes for flags just in case? Can just add `_flags: Flags` and comment that this is reserved" — on `pub struct RewardsIntegration { ... _storage_gap: StorageGap<1>, }` [doublezerofoundation/doublezero-solana#113](https://github.com/doublezerofoundation/doublezero-solana/pull/113)
@@ -181,12 +227,16 @@ Apply the classes below **class-by-class against the diff**, highest-frequency c
 
 **Current guidance** (as of 2026-04-08): Cover error scenarios (program-log checks for failures can follow in a subsequent PR but should exist), and add missing negative/edge tests when a reviewer flags them. Match **exact** error variants in test assertions. Document non-obvious test setup with a brief comment (e.g. why balances need a `-10_000` lamport correction for signature fees, or why the distribution is initialized twice to uptick the DZ epoch).
 
+**Test realism**: Reach the target state by running the **real instruction sequence**, not `set_*`/direct byte-poke helpers that mutate account bytes behind the program's back — a test that fabricates state can pass while the actual path to that state reverts. Also flag any test gated behind a feature flag that the default CI build never enables: it reports as coverage but never runs, which is worse than an absent test because it looks covered.
+
 **Why it matters**: Wildcard error assertions pass even when the program reverts for the wrong reason; undocumented magic numbers in test setup force the next reader to reverse-engineer fee math.
 
 **What to look for in a diff**:
 - New instruction with no failure/negative-path test.
 - Test assertions on `_` where a specific error variant is known.
 - Magic lamport corrections or repeated setup steps without an explaining comment.
+- Test setup that reaches target state via `set_*`/direct byte-poke helpers instead of running the real instruction sequence.
+- A test behind a feature flag the default CI build never enables (false coverage).
 
 **Examples**:
 - "I had to do a double-take on the -10_000 lamports in the grant access test. It might be worth it to say that the original payer to create the access request account is also the transaction payer, which is why the balance looks like it doesn't reconcile without this 10k lamport correction (10k lamports comes from the cost for two signatures in the transaction)." [doublezerofoundation/doublezero-solana#16](https://github.com/doublezerofoundation/doublezero-solana/pull/16)
@@ -211,6 +261,28 @@ Apply the classes below **class-by-class against the diff**, highest-frequency c
 - "Prefer `invoke_signed_unchecked` so we can remove this" — around `use solana_cpi::invoke_signed_unchecked; use solana_program::program::invoke;` [doublezerofoundation/doublezero-solana#16](https://github.com/doublezerofoundation/doublezero-solana/pull/16)
 - "Can you use `try_build_instruction` instead?" — in `fn try_collect_integration_rewards(...)` [doublezerofoundation/doublezero-solana#116](https://github.com/doublezerofoundation/doublezero-solana/pull/116)
 - "Instead of doing this, we should fix the `WithdrawIntegrationRewardsAccount`'s `From` impl to add the SPL Token program ID" — on `// - 7: SPL Token program (required so...` [doublezerofoundation/doublezero-solana#116](https://github.com/doublezerofoundation/doublezero-solana/pull/116)
+
+---
+
+### off-chain RPC / transaction hygiene *(reviewer-curated)*
+
+**Current guidance**: The off-chain clients and tooling that build and send transactions have their own failure modes distinct from on-chain code:
+- Never `unwrap()`/`expect()` on RPC-derived data (account fetches, blockhashes, simulation results) — a transient RPC hiccup then panics the process. In a `Result`-returning fn, `?`-propagate instead.
+- Fetch the recent blockhash **inside** the send method, right before signing, not as a parameter passed down from a caller — a blockhash captured earlier goes stale and the send fails.
+- Prefer a single `get_multiple_accounts` over N single `get_account` calls.
+- Pre-flight existence checks (does the account / ATA already exist?) and add the create instruction **only** when it's actually needed, rather than unconditionally.
+- Don't send zero-value or no-op transactions (e.g. a transfer of 0, a collect with nothing to collect) — check first and skip.
+- Don't set a compute-unit *price* (priority fee) on uncontended transactions; and build the CU *limit* from real measured costs plus headroom, not a guessed constant.
+
+**Why it matters**: These bugs don't fail a build or an on-chain assertion — they surface as intermittent panics, stale-blockhash send failures, wasted RPC round-trips, and needless fees in production tooling.
+
+**What to look for in a diff**:
+- `.unwrap()`/`.expect()` on the result of an RPC call inside a `Result`-returning fn.
+- A blockhash fetched by a caller and threaded into the send method as an argument.
+- A loop of single `get_account` calls where `get_multiple_accounts` fits.
+- An unconditional create-account/create-ATA instruction with no prior existence check.
+- A transaction built and sent without checking the value/effect is non-zero.
+- A hardcoded CU price on a path with no contention, or a CU limit that isn't derived from measured costs + headroom.
 
 ---
 
