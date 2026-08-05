@@ -330,7 +330,9 @@ async fn test_cannot_collect_integration_rewards_registered_after_initialization
     // The setup registered one integration before initializing the distribution,
     // so the snapshot is 1 (indices 0..=0). Registering a second integration now
     // gives it registration index 1, outside this distribution's snapshot.
-    let late_integration_program_id = Pubkey::new_unique();
+    // `mock_swap_sol_2z` is already loaded as an executable program by the test
+    // harness, satisfying registration's must-be-executable check.
+    let late_integration_program_id = mock_swap_sol_2z::ID;
     test_setup
         .initialize_rewards_integration(&admin_signer, &late_integration_program_id)
         .await
