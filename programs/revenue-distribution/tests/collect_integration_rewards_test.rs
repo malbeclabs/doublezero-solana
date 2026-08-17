@@ -367,6 +367,6 @@ async fn test_cannot_collect_integration_rewards_registered_after_initialization
     );
     assert_eq!(
         program_logs.get(2).unwrap(),
-        "Program log: Integration registration index 1 is outside this distribution's snapshot of 1"
+        "Program log: Integration registration index 1 is at or beyond this distribution's snapshot count of 1"
     );
 }

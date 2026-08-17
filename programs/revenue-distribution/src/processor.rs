@@ -1935,7 +1935,7 @@ fn try_collect_integration_rewards(accounts: &[AccountInfo]) -> ProgramResult {
     // integration stays pending. Reject it so that gate stays honest.
     if registration_index >= distribution.integrations_count_snapshot {
         msg!(
-            "Integration registration index {} is outside this distribution's snapshot of {}",
+            "Integration registration index {} is at or beyond this distribution's snapshot count of {}",
             registration_index,
             distribution.integrations_count_snapshot
         );
