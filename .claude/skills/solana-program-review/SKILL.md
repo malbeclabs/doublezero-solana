@@ -7,6 +7,8 @@ description: Use when reviewing on-chain program (Rust) code or PRs in this repo
 
 This skill distills the review conventions actually applied in this repo's PRs (feedback range **2025-08 through 2026-04**). These are Solana programs (**passport**, **revenue-distribution**) built on **bytemuck zero-copy Pod accounts** with an **8-byte precomputed discriminator**, read via `ZeroCopyAccount::try_next_accounts`. Accounts carry a `StorageGap`, guard their layout with `const _: () = assert!(size_of::<T>() == N)`, and integrate other programs over CPI (the rewards-integration path). Keep that model in mind for every review.
 
+**Scope note**: Do not import the borsh + 1-byte `AccountType` enum idioms used by `malbeclabs/doublezero`'s serviceability/geolocation programs — those are a different serialization framework than this repo's bytemuck zero-copy + 8-byte discriminator, not just a different program. This is a framework distinction, not a network one: `malbeclabs/doublezero-shreds` runs on the same DoubleZero Ledger as `malbeclabs/doublezero` yet also uses bytemuck zero-copy + 8-byte discriminators. So when borrowing guidance from elsewhere, check which serialization framework the source program actually uses, not which repo or chain it lives on.
+
 Apply the classes below **class-by-class against the diff**, highest-frequency conventions first. Each class gives the current standard, the on-chain risk, diff signals to scan for, and real review quotes with PR links.
 
 ---
@@ -41,8 +43,6 @@ Not every finding carries the same weight. Sort each one before raising it.
 - **Status / journal handling** — same replay-bit discipline, same journal-level aggregation, same idempotency guard.
 - **Counter discipline** — increments/decrements the same snapshot/collected counters the sibling does, in the same place, guarded the same way.
 
-**Why it matters**: Handlers in these programs are near-copies by design; a new one that skips a check, gates on a different authority, or forgets a counter update is a bug that only shows up when you diff it against its sibling.
-
 **What to look for in a diff**:
 - A new `try_*` handler that loads accounts differently from the sibling it's modeled on (raw fetch vs. `try_next_accounts`, different check order).
 - Authority gating that differs from sibling handlers without a stated reason.
@@ -54,8 +54,6 @@ Not every finding carries the same weight. Sort each one before raising it.
 ### naming & idiom / code style
 
 **Current guidance** (as of 2026-04-21): Names must be precise and consistent. Suffix `AccountInfo` bindings with `_info`. Rename types/vars to match their true meaning (`SolanaValidatorPayment` -> `SolanaValidatorDebt`; a bare `doublezero` -> `doublezero_ledger`). Use a `get_` prefix on fetchers. From an integration's perspective, prefer `associated_`/`parent_`/`canonical_` prefixes over a program-specific abbreviation. Reuse the existing `new_transaction` helper rather than re-rolling transaction construction. Provide `From` conversions instead of ad-hoc casts. Express domain quantities in the domain's own units (slots/epochs over human time). Use a `//` separator/summary line to describe the next several lines, not each individual line.
-
-**Why it matters**: Ambiguous names mislead the offchain readers and external integrations that derive/label these accounts, and duplicated construction logic drifts out of sync.
 
 **What to look for in a diff**:
 - `AccountInfo` bindings missing the `_info` suffix.
@@ -78,7 +76,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Current guidance** (as of 2026-04-23): For zero-copy Pod structs, put the seed/bump as the **first field** of the struct, size fields to their real range while keeping 8-byte alignment (add explicit `_padding`, prefer padding placed near related fields), and name types by intent (e.g. `UnitShare32`). Avoid magic bit masks — define named mask/shift consts for flag bits. When a bespoke instruction selector is used, use the **standard 8-byte discriminator** (`try_from_slice` into the shared enum) rather than a one-byte selector, and fall through to the program's own instruction enum on `Err`. Factor repeated balance-reads into a small `#[inline(always)]` deserialization helper.
 
-**Why it matters**: Zero-copy Pod layouts are load-bearing — field order, alignment, and discriminator width all affect how bytes are interpreted; a one-byte selector collides with the standard discriminator space and a magic mask hides intent from the next reader.
+**Why it matters**: A one-byte instruction selector collides with the standard 8-byte discriminator space, and Pod field order/alignment errors corrupt how bytes are read.
 
 **What to look for in a diff**:
 - New Pod struct where seed/bump is not the first field.
@@ -101,7 +99,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Hardcoded expected program id**: When checking an account's `owner` against another program's id (e.g. the rewards-integration program), the expected id **must** come from a hardcoded in-repo constant — never from an instruction argument or a caller-passed account. An "expected owner" supplied by the caller is no check at all: the caller just names whichever program it wants and the comparison trivially passes.
 
-**Why it matters**: Redundant checks add compute and code that can drift from the real invariant; but a genuinely missing signer check is a security hole the runtime will not backstop.
+**Why it matters**: A missing signer check is a security hole the runtime won't catch — redundant checks just cost compute.
 
 **What to look for in a diff**:
 - Writable re-checks on an account whose account-meta already forces writability.
@@ -125,7 +123,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Heap-cap hazard** *(reviewer-curated)*: If a diff grows an account-stored collection (a `Vec` or other dynamically-sized region), its maximum size **must** be enforced at the mutating instruction — the handler that appends/reallocs — not just documented. An over-grown account overflows the 32KB program heap when it's later loaded, which bricks **every** instruction that reads that account, not only the one that grew it. Pair the cap check with a near-cap boundary test (fill to `cap - 1`, then `cap`, then assert the `cap + 1` append reverts).
 
-**Why it matters**: Once an account is live, changing its size means a migration; reserved gap/flags space and size asserts turn silent layout drift into a compile error and let fields be added later. Folding deposits onto rent guarantees the account is always rent-exempt.
+**Why it matters**: Undetected layout drift forces a migration once live, and a deposit added separately from rent risks falling below the rent-exempt minimum.
 
 **What to look for in a diff**:
 - New account struct without a `StorageGap` or with no reserved flags/gap headroom.
@@ -147,7 +145,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Current guidance** (as of 2026-04-22): Keep on-chain instruction handlers dumb: read validation-only data (signatures, IDs) from instruction data and let the offchain process do heavy verification, at least for early iterations. Do not persist in account state anything the offchain reader can get straight from the instruction. Validate config invariants at the point of setting (e.g. fee must be `<` deposit). **Enforce idempotency in the program itself** — don't rely on an external integration to stop the program from collecting/processing twice.
 
-**Why it matters**: Persisting redundant data wastes space and can go stale; heavy on-chain verification burns compute for early iterations; and trusting an external integration for idempotency lets a repeated call double-collect.
+**Why it matters**: Trusting an external integration for idempotency instead of guarding in-program lets a repeated call double-collect rewards.
 
 **What to look for in a diff**:
 - On-chain signature/heavy verification that the offchain process already does.
@@ -166,8 +164,6 @@ Not every finding carries the same weight. Sort each one before raising it.
 ### documentation
 
 **Current guidance** (as of 2026-04-21): Keep the CHANGELOG accurate: add a version heading for each prior change and describe the entry with the actual scope and correct PR number. Comments should describe the block that follows (place a blank line + short summary before several lines rather than annotating each line). Update layout comments when field sizes change (e.g. storage-gap accounting). Strip dependencies and doc noise that are out of scope for the PR.
-
-**Why it matters**: A wrong PR number or missing version heading makes the changelog untrustworthy; stale layout comments mislead the next person editing a Pod struct; out-of-scope deps expand the audit surface.
 
 **What to look for in a diff**:
 - CHANGELOG entry missing a version heading for the previous release, or with a wrong/placeholder PR number.
@@ -188,7 +184,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Current guidance** (as of 2026-04-20): Model accounting invariants so a single stuck distribution can't block others: aggregate SOL/debt at the **journal level** rather than requiring every distribution to fully collect its own debt before sweeping. Where an ordering feels load-bearing, confirm it isn't — it doesn't matter *when* a replay-protection bit is set within an instruction as long as it isn't already set and all required state changes land by the end of the instruction. Track cross-account counters with snapshots (`integrations_count_snapshot` vs `integrations_collected_count`) to gate downstream steps. Relax over-strict rules that reject valid states (e.g. allow `>=` where `==` was used).
 
-**Why it matters**: An over-strict per-distribution rule can wedge the whole sweep; an exact-equality gate can reject legitimately-advanced states; and misplaced replay bits can look like correctness bugs even when they aren't.
+**Why it matters**: An over-strict per-distribution rule can wedge the whole sweep, and an exact `==` gate can wrongly reject valid advanced states.
 
 **What to look for in a diff**:
 - Sweep/collect logic that requires each distribution to fully settle its own debt before proceeding.
@@ -207,7 +203,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Current guidance** (as of 2026-04-23): Choose PDA seeds that stay stable and unambiguous for the program's whole future, not just today's caller. Prefer a **single canonical seed** used identically by every integration (e.g. `b"integration_distribution"`) over letting each integration pick its own, and expose a shared `find_*_address` helper so external programs cannot mis-derive. Cache bump seeds on the account at initialization. When picking between two candidate seed keys, favor the one that generalizes to future onboarding use cases (e.g. `service_key` over `validator_id`).
 
-**Why it matters**: Custom per-integration seeds are hard to track and easy to mis-derive; a shared `find_*_address` and a canonical seed prevent external programs from computing the wrong PDA. Caching the bump avoids re-deriving it and locks the canonical bump.
+**Why it matters**: Per-integration custom seeds are easy to mis-derive; a canonical seed plus a shared `find_*_address` helper stops external programs from computing the wrong PDA.
 
 **What to look for in a diff**:
 - Integration-specific/custom PDA seeds instead of one canonical seed prefix.
@@ -229,7 +225,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Test realism**: Reach the target state by running the **real instruction sequence**, not `set_*`/direct byte-poke helpers that mutate account bytes behind the program's back — a test that fabricates state can pass while the actual path to that state reverts. Also flag any test gated behind a feature flag that the default CI build never enables: it reports as coverage but never runs, which is worse than an absent test because it looks covered.
 
-**Why it matters**: Wildcard error assertions pass even when the program reverts for the wrong reason; undocumented magic numbers in test setup force the next reader to reverse-engineer fee math.
+**Why it matters**: Wildcard error assertions can pass even when the program reverts for the wrong reason, masking real regressions.
 
 **What to look for in a diff**:
 - New instruction with no failure/negative-path test.
@@ -249,7 +245,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Current guidance** (as of 2026-04-22): Prefer `invoke_signed_unchecked` over `invoke`/`invoke_signed` so the redundant re-serialization/verification dependency can be dropped. Build CPI instructions with the shared `try_build_instruction` helper rather than hand-constructing `Instruction` structs. Fix account-list assembly (e.g. `From` impls that must include the SPL Token program ID) at the source rather than patching the program ID in at the call site. Native programs that cannot be CPI'ed into should not carry CPI-oriented logic.
 
-**Why it matters**: `invoke_signed` re-serializes and re-verifies accounts the caller already validated; hand-built instructions and call-site patches drift from the canonical account list and are easy to get wrong.
+**Why it matters**: Hand-built CPI instructions and call-site program-ID patches drift from the canonical account list, making it easy to pass the wrong account.
 
 **What to look for in a diff**:
 - `invoke`/`invoke_signed` where `invoke_signed_unchecked` would let a re-serialization dependency be dropped.
@@ -274,7 +270,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 - Don't send zero-value or no-op transactions (e.g. a transfer of 0, a collect with nothing to collect) — check first and skip.
 - Don't set a compute-unit *price* (priority fee) on uncontended transactions; and build the CU *limit* from real measured costs plus headroom, not a guessed constant.
 
-**Why it matters**: These bugs don't fail a build or an on-chain assertion — they surface as intermittent panics, stale-blockhash send failures, wasted RPC round-trips, and needless fees in production tooling.
+**Why it matters**: These bugs don't fail a build or on-chain assertion — they surface as intermittent panics and stale-blockhash failures in production.
 
 **What to look for in a diff**:
 - `.unwrap()`/`.expect()` on the result of an RPC call inside a `Result`-returning fn.
@@ -290,7 +286,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Current guidance** (as of 2026-04-23): Use saturating/checked arithmetic for lamport and balance math and surface a real error via `ok_or_else` on the `None` case. But **don't add `checked_` operations that can never fail** — a defensive checked-sub is pushed back on when the invariant guarantees no underflow, so justify each checked op with a real overflow/underflow scenario. When indexing bitmaps, ask whether `bit`/`set_bit` should be `checked_` variants that validate the index against the type's bit width.
 
-**Why it matters**: Unchecked lamport math can wrap silently; but a `checked_` op that can never return `None` is dead defensive code, and an unchecked bitmap index can write out of bounds.
+**Why it matters**: Unchecked lamport math can wrap silently, and an unvalidated bitmap index can write out of bounds.
 
 **What to look for in a diff**:
 - Raw `+`/`-` on lamports or balances instead of `saturating_`/`checked_` with an `ok_or_else` error.
@@ -308,8 +304,6 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Current guidance** (as of 2026-04-16): Price compute-unit budgets precisely from known costs (e.g. ~1500 CU per bump-seed iteration for find-program-address) but pad with a few thousand CU of headroom because the added priority-fee cost is negligible and op prices can change. Eliminate avoidable syscalls (an extra `Rent::get`) and avoid redundant iterators/RPC shapes; prefer the smaller-scope Solana-native approach (iterate the two relevant epochs) over broader scans.
 
-**Why it matters**: Under-budgeting CU makes transactions fail; over-broad RPC scans and duplicate syscalls waste compute and complicate the code for no benefit.
-
 **What to look for in a diff**:
 - A precise CU limit with no headroom for op-price changes.
 - Avoidable syscalls (extra `Rent::get`) or duplicate iterators.
@@ -326,7 +320,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Current guidance** (as of 2026-04-16): Separate roles from payers: let an admin/authority account be **read-only** and take a distinct writable payer account so the authority key never has to fund accounts. Route authority checks through the shared `VerifiedProgramAuthority` / upgrade-authority helpers. Make privileged limits (deposits, fees) configurable in the program config rather than hardcoding constants.
 
-**Why it matters**: Forcing the authority key to also fund accounts couples a privileged signer to spending and complicates key management; hardcoded limits can't be tuned without a redeploy.
+**Why it matters**: Coupling the authority signer to funding forces a privileged key to sign spends, and hardcoded limits require a redeploy to change.
 
 **What to look for in a diff**:
 - An admin/authority account marked writable and used as the funder — split out a separate payer.
@@ -343,7 +337,7 @@ Not every finding carries the same weight. Sort each one before raising it.
 
 **Current guidance** (as of 2026-04-16): In tests, match the **exact** error variant a failing instruction produces rather than a wildcard: the system program reverts with `ProgramError::Custom(0)` for an already-created account, so assert on that instead of `_`. Emit a clear `msg!` and return a specific `ProgramError` (`InvalidInstructionData` / `InvalidAccountData`) on the failure branch.
 
-**Why it matters**: Wildcard error matches pass even when the failure is for the wrong reason; a generic error with no `msg!` leaves the offchain reader guessing why an instruction reverted.
+**Why it matters**: A generic error with no `msg!` context leaves the offchain reader unable to tell why an instruction actually reverted.
 
 **What to look for in a diff**:
 - Test error assertions on `_` where the produced variant is known (e.g. `ProgramError::Custom(0)` for an already-created account).
@@ -359,8 +353,6 @@ Not every finding carries the same weight. Sort each one before raising it.
 ### events / logging
 
 **Current guidance** (as of 2025-08-16): Program logs (`msg!`) are for the offchain reader's benefit — keep them meaningful but don't over-engineer wording. Renaming a log purely for cosmetics is unnecessary; add a code comment instead if clarity is the goal. Test error paths by reading program logs and simulating transactions before executing on a validator.
-
-**Why it matters**: Logs are the offchain reader's window into the program, but cosmetic log churn adds noise to diffs without changing behavior.
 
 **What to look for in a diff**:
 - Cosmetic-only `msg!` rewording where a code comment would serve better.
